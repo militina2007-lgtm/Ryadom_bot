@@ -1,16 +1,19 @@
 import asyncio
 import logging
+import re
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
+# ВСТАВЬТЕ ВАШ ТОКЕН
 TOKEN = "8242359420:AAHGrdoshJV4ioUTJJiAWxiSkQZCOoEynd4"
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- Главное меню (ДОБАВЛЕНА КНОПКА ПОМОЩЬ) ---
+# --- Главное меню ---
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🚶‍♀️ Создать прогулку")],
@@ -24,6 +27,64 @@ main_kb = ReplyKeyboardMarkup(
 # --- Хранилище ---
 walks = []
 user_walks = {}
+user_walk_index = {}
+user_temp = {}
+
+# --- Функция проверки даты (формат: "15 мая, 18:30") ---
+def parse_datetime(date_string):
+    # Ожидаемый формат: "15 мая, 18:30"
+    pattern = r'^(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря),\s+(\d{1,2}):(\d{2})$'
+    match = re.match(pattern, date_string.strip())
+    if not match:
+        return None
+    
+    day = int(match.group(1))
+    month_name = match.group(2)
+    hour = int(match.group(3))
+    minute = int(match.group(4))
+    
+    month_map = {
+        "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+        "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
+    }
+    month = month_map.get(month_name.lower())
+    if not month:
+        return None
+    
+    try:
+        current_year = datetime.now().year
+        dt = datetime(current_year, month, day, hour, minute)
+        return dt
+    except ValueError:
+        return None
+
+# --- Функция проверки, прошла ли дата ---
+def is_expired(datetime_str):
+    dt = parse_datetime(datetime_str)
+    if dt is None:
+        return True  # Если дата в неправильном формате — считаем просроченной
+    return dt < datetime.now()
+
+# --- Функция удаления просроченных прогулок ---
+def clean_expired_walks():
+    global walks, user_walks
+    expired_ids = []
+    for walk in walks:
+        if is_expired(walk["datetime"]):
+            expired_ids.append(walk["id"])
+    
+    if expired_ids:
+        walks = [walk for walk in walks if walk["id"] not in expired_ids]
+        # Очищаем user_walks от удалённых прогулок
+        for user in user_walks:
+            user_walks[user] = [wid for wid in user_walks[user] if wid not in expired_ids]
+
+# --- Вспомогательная функция: проверка, есть ли места ---
+def has_free_spots(walk):
+    max_members = int(walk["max"]) if walk["max"].isdigit() else 0
+    if max_members == 0:
+        return True
+    return len(walk["members"]) < max_members
 
 # --- Команда /start ---
 @dp.message(Command("start"))
@@ -40,7 +101,7 @@ async def start(message: types.Message):
         reply_markup=main_kb
     )
 
-# --- ПРАВИЛА (с обновлённым контактом) ---
+# --- ПРАВИЛА ---
 @dp.message(lambda m: m.text == "📖 Правила")
 async def show_rules(message: types.Message):
     rules_text = (
@@ -67,16 +128,7 @@ async def show_help(message: types.Message):
     )
     await message.answer(help_text, parse_mode="Markdown")
 
-# --- Вспомогательная функция: проверка, есть ли места ---
-def has_free_spots(walk):
-    max_members = int(walk["max"]) if walk["max"].isdigit() else 0
-    if max_members == 0:
-        return True
-    return len(walk["members"]) < max_members
-
 # --- Создание прогулки ---
-user_temp = {}
-
 @dp.message(lambda m: m.text == "🚶‍♀️ Создать прогулку")
 async def create_walk_start(message: types.Message):
     user_temp[message.from_user.id] = {"step": "name"}
@@ -107,12 +159,22 @@ async def create_walk_collect(message: types.Message):
         state["step"] = "datetime"
         await message.answer(
             "🕓 Теперь — когда гуляем?\n\n"
-            "Напишите дату и время в правильном формате.\n\n"
-            "Например:\n"
-            "• 20 мая, 15:00\n\n"
-            "➤ Укажите дату и время"
+            "Напишите дату и время в формате:\n"
+            "`15 мая, 18:30`\n\n"
+            "➤ Укажите дату и время",
+            parse_mode="Markdown"
         )
     elif step == "datetime":
+        # Проверка формата даты
+        if parse_datetime(message.text) is None:
+            await message.answer(
+                "❌ Неверный формат!\n\n"
+                "Напишите дату и время в формате:\n"
+                "`15 мая, 18:30`\n\n"
+                "➤ Попробуйте ещё раз",
+                parse_mode="Markdown"
+            )
+            return
         state["datetime"] = message.text
         state["step"] = "description"
         await message.answer(
@@ -198,36 +260,94 @@ async def confirm_walk(callback: types.CallbackQuery):
     
     await callback.answer()
 
-# --- Смотреть прогулки ---
+# --- Смотреть прогулки (с удалением просроченных) ---
 @dp.message(lambda m: m.text == "📅 Смотреть прогулки")
-async def show_walks(message: types.Message):
+async def show_walks_start(message: types.Message):
+    user_id = message.from_user.id
+    
+    # Удаляем просроченные прогулки
+    clean_expired_walks()
+    
     available_walks = [walk for walk in walks if has_free_spots(walk)]
     
     if not available_walks:
         await message.answer("Пока нет доступных прогулок. Загляните позже или создайте свою!")
         return
+    
+    user_walk_index[user_id] = {
+        "walks": available_walks,
+        "index": 0
+    }
+    
+    await show_current_walk(message, user_id)
 
-    for walk in available_walks:
-        current_members = len(walk["members"])
-        max_members = int(walk["max"]) if walk["max"].isdigit() else 0
-        members_text = f"{current_members}"
-        if max_members > 0:
-            members_text += f" / {max_members}"
-        
-        text = (
-            f"📍 *{walk['name']}*\n"
-            f"🗓 Когда: {walk['datetime']}\n"
-            f"📍 Где: {walk['place']}\n"
-            f"👥 Участников: {members_text}"
-        )
-        if walk.get('description'):
-            text += f"\n📝 {walk['description']}"
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Присоединиться", callback_data=f"join_{walk['id']}")]
-        ])
-        
+async def show_current_walk(message: types.Message, user_id: int, edit: bool = False, chat_id: int = None, message_id: int = None):
+    data = user_walk_index.get(user_id)
+    if not data:
+        return
+    
+    walks_list = data["walks"]
+    current_idx = data["index"]
+    
+    if current_idx >= len(walks_list):
+        await message.answer("Это была последняя прогулка. Нажмите «Смотреть прогулки» снова для обновления списка.")
+        del user_walk_index[user_id]
+        return
+    
+    walk = walks_list[current_idx]
+    
+    current_members = len(walk["members"])
+    max_members = int(walk["max"]) if walk["max"].isdigit() else 0
+    members_text = f"{current_members}"
+    if max_members > 0:
+        members_text += f" / {max_members}"
+    
+    text = (
+        f"📍 *{walk['name']}*\n"
+        f"🗓 Когда: {walk['datetime']}\n"
+        f"📍 Где: {walk['place']}\n"
+        f"👥 Участников: {members_text}"
+    )
+    if walk.get('description'):
+        text += f"\n📝 {walk['description']}"
+    
+    keyboard_buttons = [[InlineKeyboardButton(text="✅ Присоединиться", callback_data=f"join_{walk['id']}")]]
+    
+    if current_idx + 1 < len(walks_list):
+        keyboard_buttons.append([InlineKeyboardButton(text="⏩ Дальше", callback_data="next_walk")])
+    else:
+        keyboard_buttons.append([InlineKeyboardButton(text="🏁 Завершить", callback_data="end_walks")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    if edit and chat_id and message_id:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode="Markdown", reply_markup=keyboard)
+    else:
         await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+# --- Обработка кнопки Дальше ---
+@dp.callback_query(lambda c: c.data == "next_walk")
+async def next_walk(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    data = user_walk_index.get(user_id)
+    
+    if not data:
+        await callback.answer("Список прогулок устарел. Нажмите «Смотреть прогулки» заново.")
+        await callback.message.delete()
+        return
+    
+    data["index"] += 1
+    await show_current_walk(callback.message, user_id, edit=True, chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+    await callback.answer()
+
+# --- Обработка завершения просмотра ---
+@dp.callback_query(lambda c: c.data == "end_walks")
+async def end_walks(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id in user_walk_index:
+        del user_walk_index[user_id]
+    await callback.message.edit_text("🏁 Просмотр прогулок завершён. Хорошего дня!")
+    await callback.answer()
 
 # --- Присоединиться ---
 @dp.callback_query(lambda c: c.data.startswith("join_"))
@@ -245,12 +365,16 @@ async def join_walk(callback: types.CallbackQuery):
         await callback.answer("Прогулка не найдена!")
         return
     
-    if not has_free_spots(walk):
-        await callback.answer("Мест больше нет!")
+    if walk["creator"] == user_id:
+        await callback.answer("❌ Вы создатель этой прогулки!")
         return
     
     if user_id in walk["members"]:
-        await callback.answer("Вы уже записаны на эту прогулку!")
+        await callback.answer("❌ Вы уже записаны на эту прогулку!")
+        return
+    
+    if not has_free_spots(walk):
+        await callback.answer("❌ Мест больше нет!")
         return
     
     walk["members"].append(user_id)
@@ -273,7 +397,7 @@ async def join_walk(callback: types.CallbackQuery):
         f"🗓 Когда: {walk['datetime']}\n"
         f"📍 Где: {walk['place']}\n"
         f"👥 Участников: {members_text}\n\n"
-        f"✅ Вы идёте!"
+        f"✅ Вы записаны!"
     )
     if walk.get('description'):
         new_text += f"\n📝 {walk['description']}"
@@ -284,6 +408,7 @@ async def join_walk(callback: types.CallbackQuery):
 @dp.message(lambda m: m.text == "👤 Мои прогулки")
 async def my_walks(message: types.Message):
     user_id = message.from_user.id
+    clean_expired_walks()
     
     my_walks_list = []
     for walk in walks:
@@ -360,5 +485,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-    
